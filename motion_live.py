@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-vibration detector + experimental heartbeat (bcg)
-macbook pro m3 pro / apple silicon
+motion detector - vibration, orientation & experimental heartbeat (bcg)
+apple silicon (m-series) - accelerometer + gyroscope (bosch bmi286)
 requires: sudo python3 motion_live.py
           pip install PyWavelets
 """
@@ -22,8 +22,8 @@ import multiprocessing.shared_memory
 from collections import deque
 
 from spu_sensor import (
-    sensor_worker, shm_read_new,
-    SHM_NAME, SHM_SIZE,
+    sensor_worker, shm_read_new, shm_read_new_gyro,
+    SHM_NAME, SHM_NAME_GYRO, SHM_SIZE,
 )
 
 
@@ -39,9 +39,11 @@ BGRN = "\033[92m"
 BYEL = "\033[93m"
 BCYN = "\033[96m"
 BWHT = "\033[97m"
-CLEAR = "\033[2J\033[H"
-HIDE_CUR = "\033[?25l"
-SHOW_CUR = "\033[?25h"
+HIDE_CUR  = "\033[?25l"
+SHOW_CUR  = "\033[?25h"
+ENTER_ALT = "\033[?1049h"
+EXIT_ALT  = "\033[?1049l"
+CLEAR     = "\033[2J\033[H"
 
 _ANSI_RE = re.compile(r'\033\[[^m]*m')
 
@@ -125,6 +127,16 @@ class VibrationDetector:
         self._rms_window = deque(maxlen=fs)
         self._rms_dec = 0
 
+        # gyroscope latest values (deg/s)
+        self.gyro_latest = (0.0, 0.0, 0.0)
+
+        # Mahony AHRS — quaternion orientation (no gimbal lock)
+        self._q = [1.0, 0.0, 0.0, 0.0]
+        self._mahony_kp = 1.0
+        self._mahony_ki = 0.05
+        self._mahony_err_int = [0.0, 0.0, 0.0]
+        self._orient_init = False
+
         # heartbeat bcg - bandpass 0.8-3hz via cascaded 1st order iir
         self.hr_hp_alpha = fs / (fs + 2.0 * math.pi * 0.8)
         self.hr_lp_alpha = 2.0 * math.pi * 3.0 / (2.0 * math.pi * 3.0 + fs)
@@ -137,10 +149,86 @@ class VibrationDetector:
 
         self._last_evt_t = 0.0
 
+    def process_gyro(self, gx, gy, gz):
+        self.gyro_latest = (gx, gy, gz)
+
+    def _update_orientation(self, ax, ay, az):
+        """Mahony AHRS filter: fuses accel (gravity) + gyro via quaternion."""
+        a_norm = math.sqrt(ax * ax + ay * ay + az * az)
+        if a_norm < 0.3:
+            return
+
+        gx = math.radians(self.gyro_latest[0])
+        gy = math.radians(self.gyro_latest[1])
+        gz = math.radians(self.gyro_latest[2])
+        dt = 1.0 / self.fs
+
+        if not self._orient_init:
+            # bootstrap: align quaternion so that measured accel = -Z in body frame
+            ax_n, ay_n, az_n = ax / a_norm, ay / a_norm, az / a_norm
+            pitch0 = math.atan2(-ax_n, -az_n)
+            roll0 = math.atan2(ay_n, -az_n)
+            cp = math.cos(pitch0 * 0.5)
+            sp = math.sin(pitch0 * 0.5)
+            cr = math.cos(roll0 * 0.5)
+            sr = math.sin(roll0 * 0.5)
+            self._q = [
+                cr * cp,
+                sr * cp,
+                cr * sp,
+                -sr * sp,
+            ]
+            self._orient_init = True
+            return
+
+        q = self._q
+        inv_norm = 1.0 / a_norm
+        ax_n, ay_n, az_n = ax * inv_norm, ay * inv_norm, az * inv_norm
+
+        # estimated gravity direction from current quaternion
+        # (third column of rotation matrix transposed = R^T * [0,0,1])
+        qw, qx, qy, qz = q
+        vx = 2.0 * (qx * qz - qw * qy)
+        vy = 2.0 * (qw * qx + qy * qz)
+        vz = qw * qw - qx * qx - qy * qy + qz * qz
+
+        # cross product: measured_accel × estimated_gravity → error
+        # accel measures -gravity in body frame, so compare with -v
+        ex = (ay_n * (-vz) - az_n * (-vy))
+        ey = (az_n * (-vx) - ax_n * (-vz))
+        ez = (ax_n * (-vy) - ay_n * (-vx))
+
+        # PI correction
+        self._mahony_err_int[0] += self._mahony_ki * ex * dt
+        self._mahony_err_int[1] += self._mahony_ki * ey * dt
+        self._mahony_err_int[2] += self._mahony_ki * ez * dt
+
+        gx += self._mahony_kp * ex + self._mahony_err_int[0]
+        gy += self._mahony_kp * ey + self._mahony_err_int[1]
+        gz += self._mahony_kp * ez + self._mahony_err_int[2]
+
+        # integrate quaternion derivative: q_dot = 0.5 * q ⊗ [0, gx, gy, gz]
+        hdt = 0.5 * dt
+        dw = (-qx * gx - qy * gy - qz * gz) * hdt
+        dx = ( qw * gx + qy * gz - qz * gy) * hdt
+        dy = ( qw * gy - qx * gz + qz * gx) * hdt
+        dz = ( qw * gz + qx * gy - qy * gx) * hdt
+
+        qw += dw; qx += dx; qy += dy; qz += dz
+
+        # normalize
+        n = math.sqrt(qw*qw + qx*qx + qy*qy + qz*qz)
+        if n > 0:
+            inv_n = 1.0 / n
+            qw *= inv_n; qx *= inv_n; qy *= inv_n; qz *= inv_n
+
+        self._q = [qw, qx, qy, qz]
+
     def process(self, ax, ay, az, t_now):
         self.sample_count += 1
         self.latest_raw = (ax, ay, az)
         self.latest_mag = math.sqrt(ax * ax + ay * ay + az * az)
+        self._update_orientation(ax, ay, az)
 
         if not self.hp_ready:
             self.hp_prev_raw = [ax, ay, az]
@@ -559,6 +647,20 @@ class KeyboardFlashBridge:
 W = 76
 BLOCKS = ' ▁▂▃▄▅▆▇█'
 
+def _gauge(value, vmin, vmax, width):
+    """Horizontal gauge: ─ bar with ┼ at zero and ● at value position."""
+    rng = vmax - vmin
+    if rng == 0:
+        rng = 1.0
+    t = max(0.0, min(1.0, (value - vmin) / rng))
+    pos = int(t * (width - 1))
+    center = int((0.0 - vmin) / rng * (width - 1))
+    bar = ['─'] * width
+    if 0 <= center < width:
+        bar[center] = '┼'
+    bar[max(0, min(width - 1, pos))] = '●'
+    return ''.join(bar)
+
 
 def _vlen(s):
     return len(_ANSI_RE.sub('', s))
@@ -650,8 +752,9 @@ def render(det, t_start, restarts, kbflash=None):
     L = []
     a = L.append
 
-    top_bar = '─' * (W - len(' VIBRATION DETECTOR ') - 1)
-    a(f"{DIM}┌─ VIBRATION DETECTOR {top_bar}┐{RST}")
+    title = ' MOTION DETECTOR '
+    top_bar = '─' * (W - len(title) - 1)
+    a(f"{DIM}┌─{RST}{BWHT}{title}{RST}{DIM}{top_bar}┐{RST}")
 
     hdr = (f" {DIM}{el:>7.1f}s{RST}  {det.sample_count:>10,} smp  "
            f"{BWHT}{rate:>.0f}{RST} Hz  "
@@ -761,6 +864,24 @@ def render(det, t_start, restarts, kbflash=None):
         a(_line(f" {DIM}no heartbeat detected (rest wrists on laptop){RST}"))
         a(_line(''))
 
+    a(_sep(' Orientation '))
+    qw, qx, qy, qz = det._q
+    sin_r = 2.0 * (qw * qx + qy * qz)
+    cos_r = 1.0 - 2.0 * (qx * qx + qy * qy)
+    roll_d = math.degrees(math.atan2(sin_r, cos_r))
+    sin_p = 2.0 * (qw * qy - qz * qx)
+    sin_p = max(-1.0, min(1.0, sin_p))
+    pitch_d = math.degrees(math.asin(sin_p))
+    sin_y = 2.0 * (qw * qz + qx * qy)
+    cos_y = 1.0 - 2.0 * (qy * qy + qz * qz)
+    yaw_d = math.degrees(math.atan2(sin_y, cos_y))
+    gw = W - 18
+    a(_line(f' {DIM}Roll {RST} {CYN}{_gauge(roll_d, -180, 180, gw)}{RST} {roll_d:>+7.1f}°'))
+    a(_line(f' {DIM}Pitch{RST} {CYN}{_gauge(pitch_d, -90, 90, gw)}{RST} {pitch_d:>+7.1f}°'))
+    a(_line(f' {DIM}Yaw  {RST} {CYN}{_gauge(yaw_d, -180, 180, gw)}{RST} {yaw_d:>+7.1f}°'))
+    gx_v, gy_v, gz_v = det.gyro_latest
+    a(_line(f' {DIM}ω: {gx_v:>+6.2f}  {gy_v:>+6.2f}  {gz_v:>+6.2f} °/s{RST}'))
+
     a(_sep(' Events '))
     recent = list(det.events)[-5:]
     for ev in reversed(recent):
@@ -806,16 +927,23 @@ def main():
         print(f"\033[91m\033[1m[!] run with: sudo python3 {sys.argv[0]}\033[0m")
         sys.exit(1)
 
-    try:
-        old = multiprocessing.shared_memory.SharedMemory(name=SHM_NAME, create=False)
-        old.close()
-        old.unlink()
-    except FileNotFoundError:
-        pass
+    for name in (SHM_NAME, SHM_NAME_GYRO):
+        try:
+            old = multiprocessing.shared_memory.SharedMemory(name=name, create=False)
+            old.close()
+            old.unlink()
+        except FileNotFoundError:
+            pass
+
     shm = multiprocessing.shared_memory.SharedMemory(
         name=SHM_NAME, create=True, size=SHM_SIZE)
     for i in range(SHM_SIZE):
         shm.buf[i] = 0
+
+    shm_gyro = multiprocessing.shared_memory.SharedMemory(
+        name=SHM_NAME_GYRO, create=True, size=SHM_SIZE)
+    for i in range(SHM_SIZE):
+        shm_gyro.buf[i] = 0
 
     running = [True]
     restart_count = [0]
@@ -825,12 +953,13 @@ def main():
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
-    sys.stdout.write(HIDE_CUR)
+    sys.stdout.write(ENTER_ALT + HIDE_CUR)
     sys.stdout.flush()
 
     det = VibrationDetector(fs=100)
     t_start = time.time()
     last_total = 0
+    last_gyro_total = 0
     last_draw = 0.0
     last_dwt = 0.0
     last_period = 0.0
@@ -853,6 +982,7 @@ def main():
                 worker = multiprocessing.Process(
                     target=sensor_worker,
                     args=(SHM_NAME, restart_count[0]),
+                    kwargs={'gyro_shm_name': SHM_NAME_GYRO},
                     daemon=True)
                 worker.start()
 
@@ -867,6 +997,13 @@ def main():
                 t_sample = now - (n_samples - idx - 1) / det.fs
                 dyn_mag = det.process(sx, sy, sz, t_sample)
                 kbflash.update(dyn_mag, t_sample)
+
+            gyro_samples, last_gyro_total = shm_read_new_gyro(
+                shm_gyro.buf, last_gyro_total)
+            if len(gyro_samples) > MAX_BATCH:
+                gyro_samples = gyro_samples[-MAX_BATCH:]
+            for (gx, gy, gz) in gyro_samples:
+                det.process_gyro(gx, gy, gz)
 
             if now - last_dwt >= 0.2:
                 det.compute_dwt()
@@ -890,7 +1027,7 @@ def main():
             worker.kill()
             worker.join(timeout=2)
 
-        sys.stdout.write(SHOW_CUR + '\n')
+        sys.stdout.write(SHOW_CUR + EXIT_ALT + '\n')
         sys.stdout.flush()
 
         ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -913,6 +1050,8 @@ def main():
 
         shm.close()
         shm.unlink()
+        shm_gyro.close()
+        shm_gyro.unlink()
 
 
 if __name__ == '__main__':

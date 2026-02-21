@@ -1,6 +1,8 @@
 """
-reads the undocumented accelerometer on apple silicon macbooks
-via iokit hid (AppleSPUHIDDevice, vendor page 0xFF00 usage 3)
+reads the undocumented accelerometer + gyroscope on apple silicon macbooks
+via iokit hid (AppleSPUHIDDevice, vendor page 0xFF00)
+  usage 3 -> accelerometer (Bosch BMI286)
+  usage 9 -> gyroscope     (Bosch BMI286, same physical IMU)
 only tested on macbook pro m3 pro
 """
 
@@ -19,8 +21,12 @@ RING_ENTRY = 12
 SHM_HEADER = 16
 SHM_SIZE = SHM_HEADER + RING_CAP * RING_ENTRY
 SHM_NAME = 'vib_detect_shm'
+SHM_NAME_GYRO = 'vib_detect_shm_gyro'
 
 ACCEL_SCALE = 65536.0
+
+# same Q16 convention as accel; raw int32 / 65536 -> deg/s (FSR unconfirmed)
+GYRO_SCALE = 65536.0
 
 
 def shm_write_sample(buf, x_raw, y_raw, z_raw):
@@ -50,7 +56,25 @@ def shm_read_new(buf, last_total):
     return samples, total
 
 
-def sensor_worker(shm_name, restart_count):
+def shm_read_new_gyro(buf, last_total):
+    total, = struct.unpack_from('<Q', buf, 4)
+    n_new = total - last_total
+    if n_new <= 0:
+        return [], total
+    if n_new > RING_CAP:
+        n_new = RING_CAP
+    idx, = struct.unpack_from('<I', buf, 0)
+    samples = []
+    start = (idx - n_new) % RING_CAP
+    for i in range(n_new):
+        pos = (start + i) % RING_CAP
+        off = SHM_HEADER + pos * RING_ENTRY
+        x, y, z = struct.unpack_from('<iii', buf, off)
+        samples.append((x / GYRO_SCALE, y / GYRO_SCALE, z / GYRO_SCALE))
+    return samples, total
+
+
+def sensor_worker(shm_name, restart_count, gyro_shm_name=None):
     _iokit = ctypes.cdll.LoadLibrary(ctypes.util.find_library('IOKit'))
     _cf = ctypes.cdll.LoadLibrary(ctypes.util.find_library('CoreFoundation'))
 
@@ -109,9 +133,15 @@ def sensor_worker(shm_name, restart_count):
         _cf.CFNumberGetValue(ref, 4, ctypes.byref(v))
         return v.value
 
-    shm = multiprocessing.shared_memory.SharedMemory(name=shm_name, create=False)
-    buf = shm.buf
-    struct.pack_into('<I', buf, 12, restart_count)
+    accel_shm = multiprocessing.shared_memory.SharedMemory(name=shm_name, create=False)
+    accel_buf = accel_shm.buf
+    struct.pack_into('<I', accel_buf, 12, restart_count)
+
+    gyro_buf = None
+    if gyro_shm_name:
+        gyro_shm = multiprocessing.shared_memory.SharedMemory(
+            name=gyro_shm_name, create=False)
+        gyro_buf = gyro_shm.buf
 
     _REPORT_CB = ctypes.CFUNCTYPE(
         None, ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p,
@@ -119,26 +149,49 @@ def sensor_worker(shm_name, restart_count):
         ctypes.POINTER(ctypes.c_uint8), ctypes.c_long,
     )
 
-    decimate = [0]
+    accel_dec = [0]
 
-    def on_report(ctx, result, sender, rtype, rid, rpt, length):
+    def on_accel_report(ctx, result, sender, rtype, rid, rpt, length):
         try:
             # 22-byte reports: accel x/y/z as i32 at offsets 6,10,14
             # ~800hz native, we keep 1 in 8 -> ~100hz
             if length == 22:
-                decimate[0] += 1
-                if decimate[0] < 8:
+                accel_dec[0] += 1
+                if accel_dec[0] < 8:
                     return
-                decimate[0] = 0
+                accel_dec[0] = 0
                 data = bytes(rpt[:22])
                 x = struct.unpack('<i', data[6:10])[0]
                 y = struct.unpack('<i', data[10:14])[0]
                 z = struct.unpack('<i', data[14:18])[0]
-                shm_write_sample(buf, x, y, z)
+                shm_write_sample(accel_buf, x, y, z)
         except Exception:
             pass
 
-    cb_ref = _REPORT_CB(on_report)
+    accel_cb_ref = _REPORT_CB(on_accel_report)
+
+    gyro_dec = [0]
+    gyro_cb_ref = None
+
+    if gyro_buf is not None:
+        def on_gyro_report(ctx, result, sender, rtype, rid, rpt, length):
+            try:
+                # assuming same 22-byte layout as accel (x/y/z i32 at offsets 6, 10, 14)
+                # same native rate decimation -> ~100Hz
+                if length == 22:
+                    gyro_dec[0] += 1
+                    if gyro_dec[0] < 8:
+                        return
+                    gyro_dec[0] = 0
+                    data = bytes(rpt[:length])
+                    x = struct.unpack('<i', data[6:10])[0]
+                    y = struct.unpack('<i', data[10:14])[0]
+                    z = struct.unpack('<i', data[14:18])[0]
+                    shm_write_sample(gyro_buf, x, y, z)
+            except Exception:
+                pass
+
+        gyro_cb_ref = _REPORT_CB(on_gyro_report)
 
     # wake the SPU drivers
     matching = _iokit.IOServiceMatching(b'AppleSPUHIDDriver')
@@ -154,18 +207,26 @@ def sensor_worker(shm_name, restart_count):
             _iokit.IORegistryEntrySetCFProperty(svc, cfstr(k), cfnum32(v))
         _iokit.IOObjectRelease(svc)
 
-    # find accel device: vendor page 0xFF00, usage 3
+    gc_roots = []
+
+    # find accel (usage 3) and gyro (usage 9) devices
     matching = _iokit.IOServiceMatching(b'AppleSPUHIDDevice')
     it2 = ctypes.c_uint()
     _iokit.IOServiceGetMatchingServices(0, matching, ctypes.byref(it2))
-    gc_roots = []
     while True:
         svc = _iokit.IOIteratorNext(it2.value)
         if not svc:
             break
         up = prop_int(svc, 'PrimaryUsagePage') or 0
         u = prop_int(svc, 'PrimaryUsage') or 0
+
+        cb = None
         if (up, u) == (0xFF00, 3):
+            cb = accel_cb_ref
+        elif (up, u) == (0xFF00, 9) and gyro_cb_ref is not None:
+            cb = gyro_cb_ref
+
+        if cb is not None:
             hid = _iokit.IOHIDDeviceCreate(kCFAllocatorDefault, svc)
             if hid:
                 kr = _iokit.IOHIDDeviceOpen(hid, 0)
@@ -173,12 +234,12 @@ def sensor_worker(shm_name, restart_count):
                     rb = (ctypes.c_uint8 * 4096)()
                     gc_roots.append(rb)
                     _iokit.IOHIDDeviceRegisterInputReportCallback(
-                        hid, rb, 4096, cb_ref, None)
+                        hid, rb, 4096, cb, None)
                     _iokit.IOHIDDeviceScheduleWithRunLoop(
                         hid, _cf.CFRunLoopGetCurrent(), kCFRunLoopDefaultMode)
         _iokit.IOObjectRelease(svc)
 
-    gc_roots.append(cb_ref)
+    gc_roots.extend([accel_cb_ref, gyro_cb_ref])
 
     while True:
         _cf.CFRunLoopRunInMode(kCFRunLoopDefaultMode, 1.0, False)
