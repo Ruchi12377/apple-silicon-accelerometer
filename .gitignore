@@ -4,6 +4,7 @@
 *.pyc
 .DS_Store
 .cursor/
+.localbin/
 .env
 __pycache__/
 uv.lock
