@@ -31,10 +31,16 @@ you can verify the device exists on your machine with:
 
     git clone https://github.com/olvvier/apple-silicon-accelerometer
     cd apple-silicon-accelerometer
-    pip install -r requirements.txt
+    pip install -e .
     sudo python3 motion_live.py
 
 requires root because iokit hid device access on apple silicon needs elevated privileges
+
+### with uv
+
+If you have `uv`/`uvx` installed, you can also just
+
+    sudo uvx git+https://github.com/olvvier/apple-silicon-accelerometer.git
 
 ## code structure
 

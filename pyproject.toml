@@ -1,0 +1,18 @@
+[project]
+name = "apple-silicon-accelerometer"
+version = "0.1.0"
+license = "MIT"
+description = "reading the undocumented mems accelerometer on apple silicon macbooks via iokit hid"
+authors = [{ name = "Olivier Bourbonnais", email = "olvvier.b@gmail.com"}]
+requires-python = ">=3.12"
+dependencies = ["PyWavelets>=1.4"]
+
+[project.scripts]
+apple-silicon-accelerometer = "motion_live:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["motion_live", "spu_sensor"]

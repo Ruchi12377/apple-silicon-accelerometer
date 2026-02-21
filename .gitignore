@@ -1,7 +1,9 @@
-__pycache__/
-*.pyc
+*.egg-info
 *.json
 *.mov
+*.pyc
 .DS_Store
-.env
 .cursor/
+.env
+__pycache__/
+uv.lock
