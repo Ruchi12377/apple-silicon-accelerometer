@@ -65,7 +65,7 @@ def shm_write_sample(buf, x_raw, y_raw, z_raw):
     struct.pack_into('<Q', buf, 4, total + 1)
 
 
-def shm_read_new(buf, last_total):
+def shm_read_new(buf, last_total, scale=ACCEL_SCALE):
     total, = struct.unpack_from('<Q', buf, 4)
     n_new = total - last_total
     if n_new <= 0:
@@ -79,25 +79,7 @@ def shm_read_new(buf, last_total):
         pos = (start + i) % RING_CAP
         off = SHM_HEADER + pos * RING_ENTRY
         x, y, z = struct.unpack_from('<iii', buf, off)
-        samples.append((x / ACCEL_SCALE, y / ACCEL_SCALE, z / ACCEL_SCALE))
-    return samples, total
-
-
-def shm_read_new_gyro(buf, last_total):
-    total, = struct.unpack_from('<Q', buf, 4)
-    n_new = total - last_total
-    if n_new <= 0:
-        return [], total
-    if n_new > RING_CAP:
-        n_new = RING_CAP
-    idx, = struct.unpack_from('<I', buf, 0)
-    samples = []
-    start = (idx - n_new) % RING_CAP
-    for i in range(n_new):
-        pos = (start + i) % RING_CAP
-        off = SHM_HEADER + pos * RING_ENTRY
-        x, y, z = struct.unpack_from('<iii', buf, off)
-        samples.append((x / GYRO_SCALE, y / GYRO_SCALE, z / GYRO_SCALE))
+        samples.append((x / scale, y / scale, z / scale))
     return samples, total
 
 

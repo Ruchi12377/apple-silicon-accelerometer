@@ -1,18 +1,19 @@
 [project]
 name = "apple-silicon-accelerometer"
 version = "0.1.0"
-license = "MIT"
+license = "BSD-3-Clause"
 description = "reading the undocumented mems accelerometer on apple silicon macbooks via iokit hid"
 authors = [{ name = "Olivier Bourbonnais", email = "olvvier.b@gmail.com"}]
 requires-python = ">=3.12"
-dependencies = ["PyWavelets>=1.4"]
+dependencies = ["PyWavelets>=1.4", "Panda3D>=1.10.15"]
 
 [project.scripts]
 apple-silicon-accelerometer = "motion_live:main"
+tilt-maze = "tilt_maze:main"
 
 [build-system]
 requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools]
-py-modules = ["motion_live", "spu_sensor"]
+py-modules = ["motion_live", "spu_sensor", "tilt_maze"]
